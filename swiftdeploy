@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MANIFEST="manifest.yaml"
+COMPOSE_FILE="docker-compose.yml"
+NGINX_CONF="nginx.conf"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+_read_manifest() {
+  python3 -c "
+import yaml, sys
+with open('$MANIFEST') as f:
+    d = yaml.safe_load(f)
+key = '$1'.split('.')
+v = d
+for k in key:
+    v = v[k]
+print(v)
+"
+}
+
+_render_templates() {
+  python3 - <<'PYEOF'
+import yaml
+from pathlib import Path
+
+with open("manifest.yaml") as f:
+    m = yaml.safe_load(f)
+
+ctx = {
+    "service_image":  m["services"]["image"],
+    "service_port":   m["services"]["port"],
+    "mode":           m["services"].get("mode", "stable"),
+    "version":        m["services"].get("version", "1.0.0"),
+    "nginx_image":    m["nginx"]["image"],
+    "nginx_port":     m["nginx"]["port"],
+    "proxy_timeout":  m["nginx"].get("proxy_timeout", 30),
+    "network_name":   m["network"]["name"],
+    "network_driver": m["network"]["driver_type"],
+}
+
+for tmpl, out in [("templates/nginx.conf.j2", "nginx.conf"),
+                  ("templates/docker-compose.yml.j2", "docker-compose.yml")]:
+    src = Path(tmpl).read_text()
+    for k, v in ctx.items():
+        src = src.replace("{{ " + k + " }}", str(v))
+    Path(out).write_text(src)
+    print(f"  generated {out}")
+PYEOF
+}
+
+_wait_healthy() {
+  local url="$1" label="$2" timeout="${3:-60}"
+  local deadline=$(( $(date +%s) + timeout ))
+  while true; do
+    local resp
+    resp=$(curl -s "$url" 2>/dev/null) || true
+    if [[ "$resp" == *"status"* ]]; then
+      echo "  [OK] $label"
+      return 0
+    fi
+    if [[ $(date +%s) -ge $deadline ]]; then
+      echo "  [ERROR] Timed out waiting for $label"
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+# ---------------------------------------------------------------------------
+# init
+# ---------------------------------------------------------------------------
+cmd_init() {
+  echo "==> Rendering templates from $MANIFEST"
+  _render_templates
+  echo "==> Done"
+}
+
+# ---------------------------------------------------------------------------
+# validate
+# ---------------------------------------------------------------------------
+cmd_validate() {
+  local pass=0 fail=0
+
+  _check() {
+    local label="$1"; shift
+    if "$@" &>/dev/null; then
+      echo "  [PASS] $label"
+      (( pass++ )) || true
+    else
+      echo "  [FAIL] $label"
+      (( fail++ )) || true
+    fi
+  }
+
+  echo "==> Running pre-flight checks"
+
+  # 1. manifest exists and is valid YAML
+  _check "manifest.yaml exists and is valid YAML" \
+    python3 -c "import yaml; yaml.safe_load(open('$MANIFEST'))"
+
+  # 2. required fields present and non-empty
+  _check_required_fields() {
+    python3 - <<'PYEOF'
+import yaml, sys
+m = yaml.safe_load(open("manifest.yaml"))
+required = [
+    ("services","image"), ("services","port"),
+    ("nginx","image"),    ("nginx","port"),
+    ("network","name"),   ("network","driver_type"),
+]
+for keys in required:
+    v = m
+    for k in keys:
+        v = v.get(k) if isinstance(v, dict) else None
+    if not v:
+        sys.exit(1)
+PYEOF
+  }
+  _check "All required fields present and non-empty" _check_required_fields
+
+  # 3. Docker image exists locally
+  local img
+  img=$(_read_manifest services.image 2>/dev/null || echo "")
+  _check "Docker image '$img' exists locally" \
+    docker image inspect "$img"
+
+  # 4. Nginx port not already bound
+  local nport
+  nport=$(_read_manifest nginx.port 2>/dev/null || echo "")
+  _check "Nginx port $nport is not already bound" \
+    bash -c "! lsof -iTCP:$nport -sTCP:LISTEN -t 2>/dev/null | grep -q ."
+
+  # 5. nginx.conf syntactically valid (swap upstream hostname for test)
+  _check_nginx_syntax() {
+    local tmp=".nginx-check-tmp.conf"
+    sed 's|http://app:|http://127.0.0.1:|g' "$NGINX_CONF" > "$tmp"
+    docker run --rm -v "$(pwd)/$tmp:/etc/nginx/conf.d/default.conf:ro" \
+      nginx:latest nginx -t 2>&1
+    local rc=$?
+    rm -f "$tmp"
+    return $rc
+  }
+  if [[ -f "$NGINX_CONF" ]]; then
+    _check "nginx.conf is syntactically valid" _check_nginx_syntax
+  else
+    echo "  [FAIL] nginx.conf not found — run 'swiftdeploy init' first"
+    (( fail++ )) || true
+  fi
+
+  echo ""
+  echo "  Results: $pass passed, $fail failed"
+  [[ $fail -eq 0 ]]
+}
+
+# ---------------------------------------------------------------------------
+# deploy
+# ---------------------------------------------------------------------------
+cmd_deploy() {
+  echo "==> Initialising"
+  _render_templates
+
+  echo "==> Starting stack"
+  docker compose -f "$COMPOSE_FILE" up -d
+
+  local nport
+  nport=$(_read_manifest nginx.port)
+
+  echo "==> Waiting for health (timeout 60s)"
+  _wait_healthy "http://localhost:$nport/healthz" "Stack is healthy" 60
+}
+
+# ---------------------------------------------------------------------------
+# promote
+# ---------------------------------------------------------------------------
+cmd_promote() {
+  local target="${1:-}"
+  if [[ "$target" != "canary" && "$target" != "stable" ]]; then
+    echo "Usage: swiftdeploy promote [canary|stable]"
+    exit 1
+  fi
+
+  echo "==> Promoting to $target"
+
+  # Guard: stack must already be running
+  if ! docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null | grep -q swiftdeploy-app; then
+    echo "  [ERROR] Stack is not running. Run './swiftdeploy deploy' first."
+    exit 1
+  fi
+
+  python3 - "$target" <<'PYEOF'
+import yaml, sys
+target = sys.argv[1]
+with open("manifest.yaml") as f:
+    m = yaml.safe_load(f)
+m["services"]["mode"] = target
+with open("manifest.yaml", "w") as f:
+    yaml.dump(m, f, default_flow_style=False, sort_keys=False)
+print(f"  manifest.yaml updated: mode={target}")
+PYEOF
+
+  _render_templates
+
+  docker compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate app
+
+  local nport
+  nport=$(_read_manifest nginx.port)
+
+  echo "==> Waiting for service to come back"
+  _wait_healthy "http://localhost:$nport/healthz" "Service is healthy" 60
+
+  if [[ "$target" == "canary" ]]; then
+    local xmode
+    xmode=$(curl -s -o /dev/null -D - "http://localhost:$nport/" | grep -i "^x-mode:" | tr -d '[:space:]') || true
+    if [[ "$xmode" == *"canary"* ]]; then
+      echo "  [OK] X-Mode: canary confirmed"
+    else
+      echo "  [WARN] X-Mode header not detected"
+    fi
+  else
+    echo "  [OK] Promoted to stable"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# teardown
+# ---------------------------------------------------------------------------
+cmd_teardown() {
+  echo "==> Tearing down stack"
+  docker compose -f "$COMPOSE_FILE" down -v 2>/dev/null || true
+
+  if [[ "${1:-}" == "--clean" ]]; then
+    rm -f "$NGINX_CONF" "$COMPOSE_FILE"
+    echo "  Removed generated configs"
+  fi
+  echo "==> Done"
+}
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+  init)     cmd_init ;;
+  validate) cmd_validate ;;
+  deploy)   cmd_deploy ;;
+  promote)  cmd_promote "${2:-}" ;;
+  teardown) cmd_teardown "${2:-}" ;;
+  *)
+    echo "Usage: swiftdeploy {init|validate|deploy|promote [canary|stable]|teardown [--clean]}"
+    exit 1
+    ;;
+esac

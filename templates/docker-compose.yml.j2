@@ -1,0 +1,45 @@
+services:
+  app:
+    image: {{ service_image }}
+    container_name: swiftdeploy-app
+    restart: unless-stopped
+    environment:
+      MODE: "{{ mode }}"
+      APP_VERSION: "{{ version }}"
+      APP_PORT: "{{ service_port }}"
+    user: "1001:1001"
+    cap_drop:
+      - ALL
+    volumes:
+      - app-logs:/app/logs
+    networks:
+      - {{ network_name }}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:{{ service_port }}/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    expose:
+      - "{{ service_port }}"
+
+  nginx:
+    image: {{ nginx_image }}
+    container_name: swiftdeploy-nginx
+    restart: unless-stopped
+    ports:
+      - "{{ nginx_port }}:{{ nginx_port }}"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - {{ network_name }}
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  app-logs:
+
+networks:
+  {{ network_name }}:
+    driver: {{ network_driver }}
