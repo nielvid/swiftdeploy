@@ -1,0 +1,4 @@
+{
+  "min_disk_gb": 10,
+  "max_cpu_load": 2.0
+}

@@ -37,9 +37,29 @@ services:
       app:
         condition: service_healthy
 
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: swiftdeploy-opa
+    restart: unless-stopped
+    command: ["run", "--server", "--addr", "0.0.0.0:8181", "/policies"]
+    volumes:
+      - ./policies:/policies:ro
+    networks:
+      - opa-net
+    ports:
+      - "127.0.0.1:8181:8181"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8181/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
 volumes:
   app-logs:
 
 networks:
   {{ network_name }}:
     driver: {{ network_driver }}
+  opa-net:
+    driver: bridge

@@ -7,6 +7,10 @@ docker-compose.yml
 .env
 *.env
 
+# Runtime artifacts
+history.jsonl
+audit_report.md
+
 # Python
 __pycache__/
 *.pyc

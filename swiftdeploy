@@ -4,13 +4,15 @@ set -euo pipefail
 MANIFEST="manifest.yaml"
 COMPOSE_FILE="docker-compose.yml"
 NGINX_CONF="nginx.conf"
+OPA_URL="http://localhost:8181"
+HISTORY_FILE="history.jsonl"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 _read_manifest() {
   python3 -c "
-import yaml, sys
+import yaml
 with open('$MANIFEST') as f:
     d = yaml.safe_load(f)
 key = '$1'.split('.')
@@ -70,6 +72,151 @@ _wait_healthy() {
 }
 
 # ---------------------------------------------------------------------------
+# OPA helpers
+# ---------------------------------------------------------------------------
+
+# Query OPA. Args: package (infra|canary), input_json
+# Prints allow=true/false and deny reasons. Returns 0=allow 1=deny 2=unavailable
+_opa_query() {
+  local pkg="$1" input_json="$2"
+  local payload
+  payload=$(python3 -c "import json,sys; print(json.dumps({'input': json.loads(sys.argv[1])}))" "$input_json")
+
+  local resp http_code body
+  resp=$(curl -s -w "\n__HTTP_CODE__%{http_code}" \
+    -X POST "$OPA_URL/v1/data/$pkg" \
+    -H "Content-Type: application/json" \
+    -d "$payload" 2>/dev/null) || { echo "  [WARN] OPA unreachable — policy check skipped"; return 2; }
+
+  http_code=$(echo "$resp" | grep '__HTTP_CODE__' | sed 's/__HTTP_CODE__//')
+  body=$(echo "$resp" | grep -v '__HTTP_CODE__')
+
+  if [[ "$http_code" != "200" ]]; then
+    echo "  [WARN] OPA returned HTTP $http_code — policy check skipped"
+    return 2
+  fi
+
+  python3 - "$pkg" "$body" <<'PYEOF'
+import json, sys
+pkg = sys.argv[1]
+body = json.loads(sys.argv[2])
+result = body.get("result", {})
+allowed = result.get("allow", False)
+reasons = result.get("deny", [])
+print(f"allow={str(allowed).lower()}")
+for r in reasons:
+    print(f"  [DENY] {r}")
+sys.exit(0 if allowed else 1)
+PYEOF
+}
+
+# Collect host stats and run infra policy check
+_opa_check_infra() {
+  echo "==> Checking infrastructure policy"
+
+  local disk_free cpu_load
+  disk_free=$(df -g / | awk 'NR==2{print $4}')
+  cpu_load=$(uptime | awk -F'load averages?:' '{print $2}' | awk '{print $1}' | tr -d ',')
+
+  echo "  disk_free=${disk_free}GB  cpu_load=${cpu_load}"
+
+  local input_json
+  input_json=$(python3 -c "
+import json
+print(json.dumps({
+    'action': 'deploy',
+    'disk_free_gb': float('$disk_free'),
+    'cpu_load': float('$cpu_load')
+}))
+")
+
+  local rc=0
+  _opa_query "infra" "$input_json" || rc=$?
+
+  if [[ $rc -eq 1 ]]; then
+    echo "  [BLOCKED] Deployment denied by infrastructure policy"
+    exit 1
+  fi
+  [[ $rc -eq 0 ]] && echo "  [PASS] Infrastructure policy"
+  return 0
+}
+
+# Scrape /metrics, compute error rate + P99, run canary policy check
+_opa_check_canary() {
+  local nport="$1"
+  echo "==> Checking canary safety policy"
+
+  local metrics
+  metrics=$(curl -s "http://localhost:$nport/metrics" 2>/dev/null) || true
+
+  if [[ -z "$metrics" ]]; then
+    echo "  [WARN] Could not scrape /metrics — policy check skipped"
+    return 0
+  fi
+
+  local input_json
+  input_json=$(python3 - "$metrics" <<'PYEOF'
+import sys, re, json
+
+raw = sys.argv[1]
+
+# Parse http_requests_total
+total = 0
+errors = 0
+for line in raw.splitlines():
+    m = re.match(r'http_requests_total\{.*status_code="(\d+)".*\}\s+(\d+)', line)
+    if m:
+        code, count = int(m.group(1)), int(m.group(2))
+        total += count
+        if code >= 500:
+            errors += count
+
+error_rate = (errors / total) if total > 0 else 0.0
+
+# Parse histogram for P99
+buckets = []
+for line in raw.splitlines():
+    m = re.match(r'http_request_duration_seconds_bucket\{le="([^"]+)"\}\s+(\d+)', line)
+    if m:
+        le = m.group(1)
+        count = int(m.group(2))
+        if le != "+Inf":
+            buckets.append((float(le), count))
+
+p99_ms = 0
+if buckets:
+    total_obs_m = re.search(r'http_request_duration_seconds_count (\d+)', raw)
+    total_obs = int(total_obs_m.group(1)) if total_obs_m else 0
+    target = total_obs * 0.99
+    for le, count in sorted(buckets):
+        if count >= target:
+            p99_ms = int(le * 1000)
+            break
+    else:
+        p99_ms = int(buckets[-1][0] * 1000)
+
+print(json.dumps({
+    "action": "promote",
+    "error_rate": round(error_rate, 6),
+    "p99_ms": p99_ms
+}))
+PYEOF
+)
+
+  echo "  error_rate=$(python3 -c "import json; d=json.loads('$input_json'); print(f\"{d['error_rate']*100:.2f}%\")")  p99=$(python3 -c "import json; d=json.loads('$input_json'); print(f\"{d['p99_ms']}ms\")")"
+
+  local rc=0
+  _opa_query "canary" "$input_json" || rc=$?
+
+  if [[ $rc -eq 1 ]]; then
+    echo "  [BLOCKED] Promotion denied by canary safety policy"
+    exit 1
+  fi
+  [[ $rc -eq 0 ]] && echo "  [PASS] Canary safety policy"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # init
 # ---------------------------------------------------------------------------
 cmd_init() {
@@ -97,11 +244,9 @@ cmd_validate() {
 
   echo "==> Running pre-flight checks"
 
-  # 1. manifest exists and is valid YAML
   _check "manifest.yaml exists and is valid YAML" \
     python3 -c "import yaml; yaml.safe_load(open('$MANIFEST'))"
 
-  # 2. required fields present and non-empty
   _check_required_fields() {
     python3 - <<'PYEOF'
 import yaml, sys
@@ -121,19 +266,16 @@ PYEOF
   }
   _check "All required fields present and non-empty" _check_required_fields
 
-  # 3. Docker image exists locally
   local img
   img=$(_read_manifest services.image 2>/dev/null || echo "")
   _check "Docker image '$img' exists locally" \
     docker image inspect "$img"
 
-  # 4. Nginx port not already bound
   local nport
   nport=$(_read_manifest nginx.port 2>/dev/null || echo "")
   _check "Nginx port $nport is not already bound" \
     bash -c "! lsof -iTCP:$nport -sTCP:LISTEN -t 2>/dev/null | grep -q ."
 
-  # 5. nginx.conf syntactically valid (swap upstream hostname for test)
   _check_nginx_syntax() {
     local tmp=".nginx-check-tmp.conf"
     sed 's|http://app:|http://127.0.0.1:|g' "$NGINX_CONF" > "$tmp"
@@ -159,6 +301,8 @@ PYEOF
 # deploy
 # ---------------------------------------------------------------------------
 cmd_deploy() {
+  _opa_check_infra
+
   echo "==> Initialising"
   _render_templates
 
@@ -182,13 +326,17 @@ cmd_promote() {
     exit 1
   fi
 
-  echo "==> Promoting to $target"
-
-  # Guard: stack must already be running
   if ! docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null | grep -q swiftdeploy-app; then
     echo "  [ERROR] Stack is not running. Run './swiftdeploy deploy' first."
     exit 1
   fi
+
+  local nport
+  nport=$(_read_manifest nginx.port)
+
+  _opa_check_canary "$nport"
+
+  echo "==> Promoting to $target"
 
   python3 - "$target" <<'PYEOF'
 import yaml, sys
@@ -204,9 +352,6 @@ PYEOF
   _render_templates
 
   docker compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate app
-
-  local nport
-  nport=$(_read_manifest nginx.port)
 
   echo "==> Waiting for service to come back"
   _wait_healthy "http://localhost:$nport/healthz" "Service is healthy" 60
@@ -239,6 +384,265 @@ cmd_teardown() {
 }
 
 # ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+cmd_status() {
+  local nport
+  nport=$(_read_manifest nginx.port)
+
+  local prev_total=0 prev_time=0
+
+  echo "Starting status dashboard (Ctrl+C to exit)..."
+  sleep 1
+
+  while true; do
+    local now ts mode_val uptime_val chaos_val
+    now=$(date +%s)
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    local metrics
+    metrics=$(curl -s "http://localhost:$nport/metrics" 2>/dev/null) || metrics=""
+
+    # Parse metrics
+    local total errors p99_ms uptime_s app_mode chaos_state req_per_s error_rate
+    total=0; errors=0; p99_ms=0; uptime_s=0; app_mode=0; chaos_state=0
+
+    if [[ -n "$metrics" ]]; then
+      total=$(echo "$metrics" | python3 -c "
+import sys,re
+t=0
+for l in sys.stdin:
+    m=re.match(r'http_requests_total\{.*\}\s+(\d+)',l)
+    if m: t+=int(m.group(1))
+print(t)")
+      errors=$(echo "$metrics" | python3 -c "
+import sys,re
+e=0
+for l in sys.stdin:
+    m=re.match(r'http_requests_total\{.*status_code=\"([5]\d\d)\".*\}\s+(\d+)',l)
+    if m: e+=int(m.group(2))
+print(e)")
+      uptime_s=$(echo "$metrics" | grep "^app_uptime_seconds " | awk '{print $2}' | cut -d. -f1)
+      app_mode=$(echo "$metrics" | grep "^app_mode " | awk '{print $2}')
+      chaos_state=$(echo "$metrics" | grep "^chaos_active " | awk '{print $2}')
+
+      # P99 from histogram
+      p99_ms=$(echo "$metrics" | python3 -c "
+import sys,re
+buckets=[]
+total_obs=0
+for l in sys.stdin:
+    m=re.match(r'http_request_duration_seconds_bucket\{le=\"([^\"]+)\"\}\s+(\d+)',l)
+    if m and m.group(1)!='+Inf': buckets.append((float(m.group(1)),int(m.group(2))))
+    m2=re.match(r'http_request_duration_seconds_count (\d+)',l)
+    if m2: total_obs=int(m2.group(1))
+p99=0
+if buckets and total_obs:
+    target=total_obs*0.99
+    for le,c in sorted(buckets):
+        if c>=target: p99=int(le*1000); break
+    else: p99=int(sorted(buckets)[-1][0]*1000)
+print(p99)")
+    fi
+
+    # req/s delta
+    if [[ $prev_time -gt 0 && $now -gt $prev_time ]]; then
+      req_per_s=$(python3 -c "print(round(($total-$prev_total)/($now-$prev_time),1))")
+    else
+      req_per_s="0.0"
+    fi
+    prev_total=$total
+    prev_time=$now
+
+    error_rate=$(python3 -c "print(f'{($errors/$total*100) if $total>0 else 0:.2f}')")
+    local mode_str chaos_str
+    mode_str=$([ "$app_mode" = "1" ] && echo "canary" || echo "stable")
+    chaos_str=$(python3 -c "print({0:'none',1:'slow',2:'error'}.get($chaos_state,'none'))")
+
+    # Query OPA policies
+    local infra_status canary_status infra_detail canary_detail
+    local disk_free cpu_load
+    disk_free=$(df -g / | awk 'NR==2{print $4}')
+    cpu_load=$(uptime | awk -F'load averages?:' '{print $2}' | awk '{print $1}' | tr -d ',')
+
+    local infra_input canary_input
+    infra_input=$(python3 -c "import json; print(json.dumps({'action':'deploy','disk_free_gb':float('$disk_free'),'cpu_load':float('$cpu_load')}))")
+    canary_input=$(python3 -c "import json; print(json.dumps({'action':'promote','error_rate':float('$errors')/max(float('$total'),1),'p99_ms':$p99_ms}))")
+
+    infra_result=$(curl -s -X POST "$OPA_URL/v1/data/infra" \
+      -H "Content-Type: application/json" \
+      -d "{\"input\": $infra_input}" 2>/dev/null) || infra_result=""
+    canary_result=$(curl -s -X POST "$OPA_URL/v1/data/canary" \
+      -H "Content-Type: application/json" \
+      -d "{\"input\": $canary_input}" 2>/dev/null) || canary_result=""
+
+    infra_status="UNAVAILABLE"
+    canary_status="UNAVAILABLE"
+    if [[ -n "$infra_result" ]]; then
+      infra_status=$(echo "$infra_result" | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',{}); print('PASS' if r.get('allow') else 'FAIL')")
+    fi
+    if [[ -n "$canary_result" ]]; then
+      canary_status=$(echo "$canary_result" | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',{}); print('PASS' if r.get('allow') else 'FAIL')")
+    fi
+
+    # Append to history.jsonl
+    python3 -c "
+import json
+from datetime import datetime
+record = {
+    'ts': '$ts',
+    'mode': '$mode_str',
+    'req_per_s': $req_per_s,
+    'p99_ms': $p99_ms,
+    'error_rate': float('$error_rate') / 100,
+    'uptime_s': $uptime_s,
+    'chaos': '$chaos_str',
+    'policy': {'infra': '$infra_status', 'canary': '$canary_status'}
+}
+with open('$HISTORY_FILE', 'a') as f:
+    f.write(json.dumps(record) + '\n')
+"
+
+    # Render dashboard
+    clear
+    echo "==> SwiftDeploy Status  [$ts]  mode=$mode_str"
+    echo ""
+    echo "  Throughput : ${req_per_s} req/s"
+    echo "  P99 Latency: ${p99_ms}ms"
+    echo "  Error Rate : ${error_rate}%"
+    echo "  Uptime     : ${uptime_s}s"
+    echo "  Chaos      : ${chaos_str}"
+    echo ""
+    echo "  Policy Compliance:"
+    echo "    [$infra_status] infra   — disk=${disk_free}GB cpu=${cpu_load}"
+    echo "    [$canary_status] canary  — error_rate=${error_rate}% p99=${p99_ms}ms"
+    echo ""
+    echo "  (Ctrl+C to exit)"
+
+    sleep 5
+  done
+}
+
+# ---------------------------------------------------------------------------
+# audit
+# ---------------------------------------------------------------------------
+cmd_audit() {
+  if [[ ! -f "$HISTORY_FILE" ]]; then
+    echo "No history.jsonl found — run 'swiftdeploy status' first to collect data."
+    exit 1
+  fi
+
+  python3 - <<'PYEOF'
+import json
+from pathlib import Path
+
+records = []
+for line in Path("history.jsonl").read_text().splitlines():
+    line = line.strip()
+    if line:
+        records.append(json.loads(line))
+
+if not records:
+    print("history.jsonl is empty.")
+    exit(1)
+
+lines = []
+lines.append("# SwiftDeploy Audit Report")
+lines.append("")
+lines.append(f"Generated from `history.jsonl` — {len(records)} snapshots")
+lines.append("")
+
+# Timeline table
+lines.append("## Timeline")
+lines.append("")
+lines.append("| Timestamp | Mode | Req/s | P99 (ms) | Error Rate | Chaos | Infra | Canary |")
+lines.append("|---|---|---|---|---|---|---|---|")
+
+prev_mode = None
+for r in records:
+    mode_flag = " ⬆" if r["mode"] != prev_mode and prev_mode is not None else ""
+    prev_mode = r["mode"]
+    infra = r["policy"]["infra"]
+    canary = r["policy"]["canary"]
+    lines.append(
+        f"| {r['ts']} | {r['mode']}{mode_flag} | {r['req_per_s']} | {r['p99_ms']} "
+        f"| {r['error_rate']*100:.2f}% | {r['chaos']} | {infra} | {canary} |"
+    )
+
+lines.append("")
+
+# Violations section
+violations = [
+    r for r in records
+    if r["policy"]["infra"] == "FAIL" or r["policy"]["canary"] == "FAIL"
+]
+
+lines.append("## Policy Violations")
+lines.append("")
+if not violations:
+    lines.append("_No policy violations recorded._")
+else:
+    lines.append("| Timestamp | Domain | Mode | Detail |")
+    lines.append("|---|---|---|---|")
+    for r in violations:
+        if r["policy"]["infra"] == "FAIL":
+            lines.append(
+                f"| {r['ts']} | infra | {r['mode']} "
+                f"| disk or CPU threshold breached |"
+            )
+        if r["policy"]["canary"] == "FAIL":
+            lines.append(
+                f"| {r['ts']} | canary | {r['mode']} "
+                f"| error_rate={r['error_rate']*100:.2f}% p99={r['p99_ms']}ms |"
+            )
+
+lines.append("")
+
+# Mode change events
+lines.append("## Mode Changes")
+lines.append("")
+changes = []
+prev = None
+for r in records:
+    if r["mode"] != prev:
+        changes.append((r["ts"], prev or "—", r["mode"]))
+        prev = r["mode"]
+
+if len(changes) <= 1:
+    lines.append("_No mode changes recorded._")
+else:
+    lines.append("| Timestamp | From | To |")
+    lines.append("|---|---|---|")
+    for ts, frm, to in changes[1:]:
+        lines.append(f"| {ts} | {frm} | {to} |")
+
+lines.append("")
+
+# Chaos events
+lines.append("## Chaos Events")
+lines.append("")
+chaos_events = [r for r in records if r["chaos"] != "none"]
+if not chaos_events:
+    lines.append("_No chaos events recorded._")
+else:
+    lines.append("| Timestamp | Mode | Chaos Type | Error Rate | P99 (ms) |")
+    lines.append("|---|---|---|---|---|")
+    for r in chaos_events:
+        lines.append(
+            f"| {r['ts']} | {r['mode']} | {r['chaos']} "
+            f"| {r['error_rate']*100:.2f}% | {r['p99_ms']} |"
+        )
+
+lines.append("")
+
+out = "\n".join(lines)
+Path("audit_report.md").write_text(out)
+print("==> audit_report.md generated")
+print(f"    {len(records)} snapshots | {len(violations)} violations | {len(changes)-1} mode changes | {len(chaos_events)} chaos events")
+PYEOF
+}
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 case "${1:-}" in
@@ -247,8 +651,10 @@ case "${1:-}" in
   deploy)   cmd_deploy ;;
   promote)  cmd_promote "${2:-}" ;;
   teardown) cmd_teardown "${2:-}" ;;
+  status)   cmd_status ;;
+  audit)    cmd_audit ;;
   *)
-    echo "Usage: swiftdeploy {init|validate|deploy|promote [canary|stable]|teardown [--clean]}"
+    echo "Usage: swiftdeploy {init|validate|deploy|promote [canary|stable]|teardown [--clean]|status|audit}"
     exit 1
     ;;
 esac
