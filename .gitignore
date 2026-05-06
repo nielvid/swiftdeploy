@@ -9,7 +9,6 @@ docker-compose.yml
 
 # Runtime artifacts
 history.jsonl
-audit_report.md
 
 # Python
 __pycache__/
