@@ -1,6 +1,6 @@
 # SwiftDeploy Audit Report
 
-Generated from `history.jsonl` — 4 snapshots
+Generated from `history.jsonl` — 5 snapshots
 
 ## Timeline
 
@@ -10,6 +10,7 @@ Generated from `history.jsonl` — 4 snapshots
 | 2026-05-06T20:05:00Z | canary ⬆ | 8.1 | 45 | 0.00% | none | PASS | PASS |
 | 2026-05-06T20:10:00Z | canary | 7.3 | 620 | 6.00% | error | PASS | FAIL |
 | 2026-05-06T20:15:00Z | canary | 6.0 | 30 | 0.00% | none | PASS | PASS |
+| 2026-05-06T20:20:00Z | stable ⬆ | 4.8 | 10 | 0.00% | none | PASS | PASS |
 
 ## Policy Violations
 
@@ -22,6 +23,7 @@ Generated from `history.jsonl` — 4 snapshots
 | Timestamp | From | To |
 |---|---|---|
 | 2026-05-06T20:05:00Z | stable | canary |
+| 2026-05-06T20:20:00Z | canary | stable |
 
 ## Chaos Events
 
